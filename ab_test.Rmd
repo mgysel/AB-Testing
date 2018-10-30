@@ -1,0 +1,327 @@
+---
+title: 'Project 5: AB Testing'
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+
+
+
+# 0. Import Data
+
+## Import Data
+```{r}
+# Load control, treatment, transactions df's
+control <- read.csv('data/clean/control.csv')
+treatment <- read.csv('data/clean/treatment.csv')
+transactions <- read.csv('data/clean/transactions.csv')
+```
+
+## Check/Wrangle Data
+```{r}
+# Change transactions$invoice_date to datetime
+# Load dependencies
+library(lubridate)
+# Change to datetime
+transactions$invoice_date <- ymd(as.character(transactions$invoice_date))
+# Check
+str(transactions)
+
+# Remove treatment units from control units
+control <- subset(control, !(store_id %in% treatment$store_id))
+```
+
+
+
+
+# 1. Choose Target Variable
+The goal is to increase gross margin per week, so the performance metric is 
+weekly_gross_margin.
+
+
+
+
+# 2. Choose Experimental Design
+The data received includes descriptive data on both stores and transactions, 
+so a matched pair design was used.
+
+
+
+
+# 3. Choose Experimental and Control Variables
+
+## Experimental Variable
+The combination of updated restaurant menu and television advertising is the 
+experimental variable because it was adjusted to determine its effect on 
+the target variable, weekly gross margin.
+
+## Control Variables
+
+### List potential control variables we have data for
+1. sq_ft
+2. average monthly sales
+
+### Wrangle data to obtain gross margins per store
+```{r}
+# Determine gross_margin
+
+# Load dependencies
+library(dplyr)
+
+# gross margin per store
+sum_transactions <- transactions %>% 
+  group_by(store_id) %>%
+  summarise(sum_gross_margin=sum(gross_margin))
+
+# Join treatment/control df's to sum_gross_margin
+treatment <- left_join(treatment, sum_transactions, by='store_id')
+control <- left_join(control, sum_transactions, by='store_id')
+```
+
+### Check correlations between sum_gross_margin and potential control variables
+```{r}
+# Check correlations
+cor(control[c('sum_gross_margin', 'sq_ft', 'avg_month_sales')])
+```
+Of the potential control variables of interest, sq_ft and avg_month_sales, only
+avg_month_sales is correlated to the target variable, sum_gross_margin. As a 
+result, avg_month_sales was selected as the only control variable.
+
+
+
+
+# 4. Choose the Treatment and Control Units
+
+## Treatment Units
+The treatment units are the 10 stores in the treatment dataframe
+
+## Control Units
+Per project guidance, two control units from the control dataframe should be
+matched to each treatment unit from the treatment dataframe.
+```{r}
+# Load dependencies
+library(MatchIt)
+
+# Include treatment column in treatment/control df's
+treatment$treatment <- 1
+control$treatment <- 0
+
+# Divide Central and West Regions
+central_units <- subset(rbind(control, treatment), region=='Central')
+west_units <- subset(rbind(control, treatment), region=='West')
+
+# Match the samples
+# Central
+matches_central <- matchit(treatment ~ avg_month_sales,
+        data=central_units,
+        method='nearest',
+        ratio=2)
+# West
+matches_west <- matchit(treatment ~ avg_month_sales,
+        data=west_units,
+        method='nearest',
+        ratio=2)
+
+# Obtain matrix of matched units
+matches_central <- matches_central$match.matrix
+matches_west <- matches_west$match.matrix
+
+# Create df of treatment and control store_id's
+# Central
+tu_central <- central_units[rownames(matches_central),]$store_id
+cu1_central <- central_units[matches_central[,1],]$store_id
+cu2_central <- central_units[matches_central[,2],]$store_id
+match_matrix_central <- data.frame(tu_central, cu1_central, cu2_central)
+names(match_matrix_central) <- c('Treatment Store', 'Control Store 1', 'Control Store 2')
+# West
+tu_west <- west_units[rownames(matches_west),]$store_id
+cu1_west <- west_units[matches_west[,1],]$store_id
+cu2_west <- west_units[matches_west[,2],]$store_id
+match_matrix_west <- data.frame(tu_west, cu1_west, cu2_west)
+names(match_matrix_west) <- c('Treatment Store', 'Control Store 1', 'Control Store 2')
+
+# Combine match_matrix_central and match_matrix_west
+match_matrix <- rbind(match_matrix_central, match_matrix_west)
+# Display Treatment and Control Units
+match_matrix
+```
+
+
+
+
+# 5. Clean and Prepare Data
+
+## Helper Functions
+```{r}
+# Filters transaction data by date and calculates the weekly gross margin per store
+# Inputs transaction data, start date, and end date
+# Outputs a df with store_id, weekly_gross_margins, and id columns
+wgm_by_dates <- function(df, date1, date2) {
+  # Calculate weekly gross margins by date
+  wgm_by_dates <- subset(df, invoice_date>=date1 & invoice_date<=date2) %>%
+    group_by(invoice_week=cut(invoice_date, "week"), store_id) %>% 
+    summarise(gross_margin=sum(gross_margin)) %>%
+    group_by(store_id) %>%
+    summarise(weekly_gross_margin=mean(gross_margin))
+  # Add rownames as column to make joins easier
+  wgm_by_dates$index <- as.numeric(row.names(wgm_by_dates))
+  return(wgm_by_dates)
+}
+```
+
+## Comparative Dates
+```{r}
+# Filter data by test dates (2015-04-29 to 2015-07-21)
+# and calculate weekly_gross_margin
+wgm_comparative_dates <- wgm_by_dates(transactions, '2015-04-29', '2015-07-21')
+
+# Create dataframe of weekly_gross_margins for treatment/control units
+
+# TREATMENT
+wgm_comparative_treatment <- left_join(match_matrix, wgm_comparative_dates, by=c('Treatment Store'='store_id'))$weekly_gross_margin
+
+# CONTROL
+wgm_comparative_control1 <- left_join(match_matrix, wgm_comparative_dates, by=c('Control Store 1'='store_id'))$weekly_gross_margin
+wgm_comparative_control2 <- left_join(match_matrix, wgm_comparative_dates, by=c('Control Store 2'='store_id'))$weekly_gross_margin
+wgm_comparative_control <- rowMeans(data.frame(wgm_comparative_control1, wgm_comparative_control2))
+# Create dataframe of treatment and control weekly_gross_margin
+wgm_comparative <- data.frame(wgm_comparative_treatment, wgm_comparative_control)
+names(wgm_comparative) <- c('Treatment', 'Control')
+```
+
+## Test Dates
+```{r}
+# Filter data by test dates (2016-04-29 to 2016-07-21)
+# and calculate weekly_gross_margin
+wgm_test_dates <- wgm_by_dates(transactions, '2016-04-29', '2016-07-21')
+
+# Create dataframe of weekly_gross_margins for treatment/control units
+
+# TREATMENT
+wgm_test_treatment <- left_join(match_matrix, wgm_test_dates, by=c('Treatment Store'='store_id'))$weekly_gross_margin
+
+# CONTROL
+wgm_test_control1 <- left_join(match_matrix, wgm_test_dates, by=c('Control Store 1'='store_id'))$weekly_gross_margin
+wgm_test_control2 <- left_join(match_matrix, wgm_test_dates, by=c('Control Store 2'='store_id'))$weekly_gross_margin
+wgm_test_control <- rowMeans(data.frame(wgm_test_control1, wgm_test_control2))
+# Create dataframe of treatment and control weekly_gross_margin
+wgm_test <- data.frame(wgm_test_treatment, wgm_test_control)
+names(wgm_test) <- c('Treatment', 'Control')
+```
+
+
+
+
+# 6. Calculate Lift
+
+```{r}
+# Create df of increase in wgm by control, increase in wgm by treatment
+lift_control <- wgm_test$Control/wgm_comparative$Control
+lift_treatment <- wgm_test$Treatment/wgm_comparative$Treatment
+lift <- data.frame(lift_control, lift_treatment)
+
+# Calculate increase in weekly_gross_margin of treatment relative to control
+lift_overall <- mean(lift$lift_treatment)/mean(lift$lift_control)
+lift_west <- mean(lift$lift_treatment[1:5])/mean(lift$lift_control[1:5])
+lift_central <- mean(lift$lift_treatment[6:10])/mean(lift$lift_control[6:10])
+lift_overall
+lift_west
+lift_central
+```
+The calculated overall lift is approximately 46%, while the calculated lift for
+west region stores is approximately 43% and the calculated lift for central
+region stores is approximately 49%.
+
+
+
+
+# 7. Calculate Statistical Significance
+
+```{r}
+# Paired T-Test because the test conducted was matched pair
+# Overall lift
+t.test(lift$lift_treatment, lift$lift_control, paired=TRUE)
+# Central lift
+t.test(lift$lift_treatment[1:5], lift$lift_control[1:5], paired=TRUE)
+# West lift
+t.test(lift$lift_treatment[6:10], lift$lift_control[6:10], paired=TRUE)
+```
+With a p-value of 0.0001156, there is sufficient evidence to reject the null 
+hypothesis, that there is no difference in weekly gross margins between the 
+control and treatment groups, in favor of the alternative hypothesis, that there 
+is a difference in weekly gross margins between the control and treatment 
+groups. The t-test estimated lift is approximately 44% for all stores, 42% for
+west region stores and 46% for central region stores.
+
+
+
+# 8. Summary
+
+## Planning the Analysis
+Round Roasters, a coffee restaurant in the US, conducted a market test to 
+determine the impacts of introducting a new menu and television marketing 
+campaign. Because Round Roasters was interested in profitability and buying
+coffee follows a weekly cycle for customers, data was aggregated weekly and
+weekly gross margin was used as the target metric. Because Round Roasters 
+collected data on their stores and transactions, a matched pair analysis was 
+used. This matched pair analysis was conducted using the test period (April 29, 
+2016 to July 21, 2016) and the comparative period (April 29, 2015 to July 21, 
+2015).
+
+## Matching Treatent and Control Units
+
+### Determining Control Units
+Two potential control variables were chosen for their logical validity and
+data availability: 
+1. square footage 
+2. average monthly sales
+
+Per the correlation matrix below, average monthly sales correlates with gross
+margin, with a correlation coefficient of 0.995, while square footage does not
+correlate with gross margin, with a correlation coefficient of -0.029. Thus,
+average monthly sales was the only control variable used in the analysis.
+```{r echo=FALSE}
+cor(control[c('sum_gross_margin', 'sq_ft', 'avg_month_sales')])
+```
+
+
+### Matching Treatment and Control Units
+
+The following control units were matched to their respective treatment units, 
+controlling for weekly sales and region of each store.
+```{r echo=FALSE}
+match_matrix
+```
+
+## Analysis
+
+A paired t-test was conducted between the increase in weekly gross sales between
+the test period (April 29, 2016 to July 21, 2016) and the comparative period 
+(April 29, 2015 to July 21, 2015) for the treatment units and average of the 
+control units. With a p-value of 0.0001156, there is sufficient evidence to 
+reject the null hypothesis, that there is no difference in weekly gross margin 
+between the control and treatment groups, in favor of the alternative 
+hypothesis, that there is a difference in weekly gross margin between the 
+control and treatment groups. Per the bar graph of lift for each 
+treatment-control unit pair below, the increase in incremental lift between 
+treatment and control units is 44% for all stores. Because the increase in 
+incremental lift for the new menu is statistically significant in both central 
+region stores, at 46%, and west region stores, at 42%, it should be implemented 
+in both central and west region stores.
+
+```{r echo=FALSE}
+# Load dependencies
+library(ggplot2)
+
+# Visualize lift differences between treatment and control units
+# Add column for unit
+lift$control_number <- rownames(lift)
+ggplot(aes(x=control_number, y=lift_treatment, color='Treatment'), data=lift) +
+  geom_col() +
+  geom_col(aes(y=lift_control, color='Control')) +
+  xlab('Treatment-Control Pair') +
+  ylab('Lift') +
+  ggtitle('Lift for Treatment and Control Units')
+```
+
